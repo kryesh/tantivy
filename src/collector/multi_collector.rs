@@ -236,6 +236,13 @@ impl SegmentCollector for MultiCollectorChild {
         Ok(())
     }
 
+    fn collect_block(&mut self, docs: &[(DocId, Score)]) -> crate::Result<()> {
+        for child in &mut self.children {
+            child.collect_block(docs)?;
+        }
+        Ok(())
+    }
+
     fn harvest(self) -> MultiFruit {
         MultiFruit {
             sub_fruits: self
