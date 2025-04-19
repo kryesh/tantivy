@@ -38,8 +38,8 @@ impl LogMergePolicy {
     /// Set the target number of documents to have in a segment, a segment can have up to
     /// `(target_segment_size * 2) - 2` documents, but the policy will try to keep them as close as
     /// possible to `target_segment_size`
-    pub fn set_target_segment_size(&mut self, max_docs_merge_size: usize) {
-        self.target_segment_size = max_docs_merge_size;
+    pub fn set_target_segment_size(&mut self, target_segment_size: usize) {
+        self.target_segment_size = target_segment_size;
     }
 
     /// Set the minimum segment size under which all segment belong
