@@ -3,7 +3,7 @@ use std::cmp;
 use itertools::Itertools;
 
 use super::merge_policy::{MergeCandidate, MergePolicy};
-use crate::index::SegmentMeta;
+use crate::index::{SegmentId, SegmentMeta};
 
 const DEFAULT_LEVEL_LOG_SIZE: f64 = 0.75;
 const DEFAULT_MIN_LAYER_SIZE: u32 = 10_000;
@@ -76,52 +76,39 @@ impl LogMergePolicy {
         self.del_docs_ratio_before_merge = del_docs_ratio_before_merge;
     }
 
-    fn has_segment_above_deletes_threshold(&self, level: &[&SegmentMeta]) -> bool {
-        level
-            .iter()
-            .any(|segment| deletes_ratio(segment) > self.del_docs_ratio_before_merge)
+    fn has_segment_above_deletes_threshold(&self, level: &[(u32, u32, SegmentId)]) -> bool {
+        level.iter().any(|(docs, deleted, _)| match docs {
+            0 => false,
+            _ => (*deleted as f32 / *docs as f32) > self.del_docs_ratio_before_merge,
+        })
     }
-}
-
-fn deletes_ratio(segment: &SegmentMeta) -> f32 {
-    if segment.max_doc() == 0 {
-        return 0f32;
-    }
-    segment.num_deleted_docs() as f32 / segment.max_doc() as f32
 }
 
 impl MergePolicy for LogMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
-        // Get segments that are small enough to be merged and sort them by size in descending
-        // order.
-        let size_sorted_segments = segments
-            .iter()
-            .filter(|seg| (seg.num_docs() as usize) < self.target_segment_size)
-            .sorted_by_key(|seg| std::cmp::Reverse(seg.max_doc()))
-            .collect_vec();
-
-        // If there are no small enough segments, return an empty vector.
-        if size_sorted_segments.is_empty() {
-            return Vec::new();
-        }
-
         let mut candidates = Vec::new();
-        let mut levels = Vec::new();
         let mut unmerged_docs = 0usize;
         let mut current_max_log_size = f64::MAX;
-        for (_, merge_group) in &size_sorted_segments.into_iter().chunk_by(|segment| {
-            let segment_log_size = f64::from(self.clip_min_size(segment.num_docs())).log2();
-            if segment_log_size < (current_max_log_size - self.level_log_size) {
-                // update current_max_log_size to create a new group
-                current_max_log_size = segment_log_size;
-            }
-            // accumulate the number of documents
-            unmerged_docs += segment.num_docs() as usize;
-            // return current_max_log_size to be grouped to the current group
-            current_max_log_size
-        }) {
-            levels.push(merge_group.collect::<Vec<&SegmentMeta>>());
-        }
+        let mut levels = segments
+            .iter()
+            .map(|seg| (seg.max_doc(), seg.num_deleted_docs(), seg.id()))
+            .filter(|(max_doc, deleted, ..)| {
+                ((max_doc - deleted) as usize) < self.target_segment_size
+            })
+            .inspect(|(max_doc, deleted, ..)| unmerged_docs += (max_doc - deleted) as usize) // accumulate the number of documents
+            .sorted_by_key(|(max_doc, deleted, ..)| std::cmp::Reverse(max_doc - deleted))
+            .chunk_by(|(max_doc, deleted, ..)| {
+                let segment_log_size = f64::from(self.clip_min_size(max_doc - deleted)).log2();
+                if segment_log_size < (current_max_log_size - self.level_log_size) {
+                    // update current_max_log_size to create a new group
+                    current_max_log_size = segment_log_size;
+                }
+                // return current_max_log_size to be grouped to the current group
+                current_max_log_size
+            })
+            .into_iter()
+            .map(|(_, m)| m.collect_vec())
+            .collect_vec();
 
         // If the total number of unmerged documents is large enough to reach the target size,
         // then start collecting segments in ascending size until we reach the target size.
@@ -130,9 +117,9 @@ impl MergePolicy for LogMergePolicy {
             let mut batch = Vec::new();
             // Pop segments segments from levels, smallest first due to sort at start
             while let Some(segments) = levels.pop() {
-                for s in segments {
-                    batch_docs += s.num_docs() as usize;
-                    batch.push(s);
+                for (max_doc, deleted, id) in segments {
+                    batch_docs += (max_doc - deleted) as usize;
+                    batch.push((max_doc, deleted, id));
 
                     // If the current batch has enough documents to be merged, create a merge
                     // candidate and push it to candidates
@@ -141,7 +128,7 @@ impl MergePolicy for LogMergePolicy {
                         batch_docs = 0;
                         candidates.push(MergeCandidate(
                             // drain to reuse the buffer
-                            batch.drain(..).map(|seg| seg.id()).collect(),
+                            batch.drain(..).map(|(.., id)| id).collect(),
                         ));
                     }
                 }
@@ -168,7 +155,7 @@ impl MergePolicy for LogMergePolicy {
             })
             .for_each(|level| {
                 candidates.push(MergeCandidate(
-                    level.into_iter().map(|seg| seg.id()).collect(),
+                    level.into_iter().map(|(.., id)| id).collect(),
                 ))
             });
 
