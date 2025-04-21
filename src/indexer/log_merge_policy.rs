@@ -141,7 +141,7 @@ impl MergePolicy for LogMergePolicy {
                 let mut hit_delete_threshold = false;
                 group.into_iter().for_each(|(_, seg)| {
                     batch.push(seg.id());
-                    if self.segment_above_deletes_threshold(seg) {
+                    if !hit_delete_threshold && self.segment_above_deletes_threshold(seg) {
                         hit_delete_threshold = true;
                     }
                 });
