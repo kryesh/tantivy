@@ -89,18 +89,18 @@ impl LogMergePolicy {
 
 impl MergePolicy for LogMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
-        let mut unmerged_docs = 0usize;
+        let mut unmerged_docs = 0;
         let mut levels = segments
             .iter()
             .map(|seg| (seg.num_docs() as usize, seg))
             .filter(|(docs, _)| *docs < self.target_segment_size)
-            .sorted_by(|(a, _), (b, _)| b.cmp(a))
             .inspect(|(docs, _)| unmerged_docs += docs)
+            .sorted_by(|(a, _), (b, _)| b.cmp(a))
             .collect_vec();
 
         let mut candidates = Vec::new();
         if unmerged_docs >= self.target_segment_size {
-            let mut batch_docs = 0usize;
+            let mut batch_docs = 0;
             let mut batch = Vec::new();
             // Pop segments segments from levels, smallest first due to sort at start
             while let Some((docs, seg)) = levels.pop() {
