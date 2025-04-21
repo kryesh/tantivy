@@ -89,33 +89,22 @@ impl LogMergePolicy {
 
 impl MergePolicy for LogMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
-        let mut candidates = Vec::new();
         let mut unmerged_docs = 0usize;
-        let mut current_max_log_size = f64::MAX;
         let mut levels = segments
             .iter()
             .map(|seg| (seg.num_docs() as usize, seg))
             .filter(|(docs, _)| *docs < self.target_segment_size)
             .sorted_by(|(a, _), (b, _)| b.cmp(a))
-            .map(|(num_docs, seg)| {
-                let segment_log_size = f64::from(self.clip_min_size(num_docs as u32)).log2();
-                if segment_log_size < (current_max_log_size - self.level_log_size) {
-                    // update current_max_log_size to create a new group
-                    current_max_log_size = segment_log_size;
-                }
-                // accumulate the number of documents
-                unmerged_docs += num_docs;
-                // return current_max_log_size to be grouped to the current group
-                (current_max_log_size, seg)
-            })
+            .inspect(|(docs, _)| unmerged_docs += docs)
             .collect_vec();
 
+        let mut candidates = Vec::new();
         if unmerged_docs >= self.target_segment_size {
             let mut batch_docs = 0usize;
             let mut batch = Vec::new();
             // Pop segments segments from levels, smallest first due to sort at start
-            while let Some((_, seg)) = levels.pop() {
-                batch_docs += seg.num_docs() as usize;
+            while let Some((docs, seg)) = levels.pop() {
+                batch_docs += docs;
                 batch.push(seg);
 
                 // If the current batch has enough documents to be merged, create a merge
@@ -134,9 +123,18 @@ impl MergePolicy for LogMergePolicy {
             }
         }
 
+        let mut current_max_log_size = f64::MAX;
         let mut batch = Vec::new();
         levels
             .iter()
+            .map(|(docs, seg)| {
+                let segment_log_size = f64::from(self.clip_min_size(*docs as u32)).log2();
+                if segment_log_size < (current_max_log_size - self.level_log_size) {
+                    // update current_max_log_size to create a new group
+                    current_max_log_size = segment_log_size;
+                }
+                (current_max_log_size, seg)
+            })
             .chunk_by(|(level, _)| *level)
             .into_iter()
             .for_each(|(_, group)| {
