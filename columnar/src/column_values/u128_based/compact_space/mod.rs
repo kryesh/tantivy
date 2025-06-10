@@ -591,8 +591,8 @@ mod tests {
     }
 
     fn test_all(mut data: OwnedBytes, expected: &[u128]) {
-        let _header = U128Header::deserialize(&mut data);
-        let decompressor = CompactSpaceDecompressor::open(data).unwrap();
+        let (_header, offset) = U128Header::deserialize(&mut data).unwrap();
+        let decompressor = CompactSpaceDecompressor::open(data, offset).unwrap();
         for (idx, expected_val) in expected.iter().cloned().enumerate() {
             let val = decompressor.get(idx as u32);
             assert_eq!(val, expected_val);
@@ -642,8 +642,8 @@ mod tests {
         ];
         let mut data = test_aux_vals(vals);
 
-        let _header = U128Header::deserialize(&mut data);
-        let decomp = CompactSpaceDecompressor::open(data).unwrap();
+        let (_header, offset) = U128Header::deserialize(&mut data).unwrap();
+        let decomp = CompactSpaceDecompressor::open(data, offset).unwrap();
         let complete_range = 0..vals.len() as u32;
         for (pos, val) in vals.iter().enumerate() {
             let val = *val;
@@ -751,7 +751,7 @@ mod tests {
     fn test_empty() {
         let vals = &[];
         let data = test_aux_vals(vals);
-        let _decomp = CompactSpaceDecompressor::open(data).unwrap();
+        let _decomp = CompactSpaceDecompressor::open(data, 0).unwrap();
     }
 
     #[test]
@@ -766,8 +766,8 @@ mod tests {
             333u128,
         ];
         let mut data = test_aux_vals(vals);
-        let _header = U128Header::deserialize(&mut data);
-        let decomp = CompactSpaceDecompressor::open(data).unwrap();
+        let (_header, offset) = U128Header::deserialize(&mut data).unwrap();
+        let decomp = CompactSpaceDecompressor::open(data, offset).unwrap();
         let complete_range = 0..vals.len() as u32;
         assert!(
             &get_positions_for_value_range_helper(&decomp, 0..=5, complete_range.clone())
