@@ -2,6 +2,7 @@ use std::io;
 use std::io::{Read, Write};
 
 use super::BinarySerializable;
+use crate::serialize::BinaryDeserializable;
 
 /// Variable int serializes a u128 number
 pub fn serialize_vint_u128(mut val: u128, output: &mut Vec<u8>) {
@@ -27,17 +28,21 @@ impl BinarySerializable for VIntU128 {
         serialize_vint_u128(self.0, &mut buffer);
         writer.write_all(&buffer)
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+impl BinaryDeserializable<'_> for VIntU128 {
+    fn deserialize(reader: &[u8]) -> io::Result<(Self, usize)> {
         let mut bytes = reader.bytes();
         let mut result = 0u128;
         let mut shift = 0u64;
+        let mut read = 0;
         loop {
             match bytes.next() {
                 Some(Ok(b)) => {
+                    read += 1;
                     result |= u128::from(b % 128u8) << shift;
                     if b >= STOP_BIT {
-                        return Ok(VIntU128(result));
+                        return Ok((VIntU128(result), read));
                     }
                     shift += 7;
                 }
@@ -162,10 +167,6 @@ impl VInt {
         self.0
     }
 
-    pub fn deserialize_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
-        VInt::deserialize(reader).map(|vint| vint.0)
-    }
-
     pub fn serialize_into_vec(&self, output: &mut Vec<u8>) {
         let mut buffer = [0u8; 10];
         let num_bytes = self.serialize_into(&mut buffer);
@@ -194,17 +195,21 @@ impl BinarySerializable for VInt {
         let num_bytes = self.serialize_into(&mut buffer);
         writer.write_all(&buffer[0..num_bytes])
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+impl BinaryDeserializable<'_> for VInt {
+    fn deserialize(reader: &[u8]) -> io::Result<(Self, usize)> {
         let mut bytes = reader.bytes();
         let mut result = 0u64;
         let mut shift = 0u64;
+        let mut read = 0;
         loop {
             match bytes.next() {
                 Some(Ok(b)) => {
+                    read += 1;
                     result |= u64::from(b % 128u8) << shift;
                     if b >= STOP_BIT {
-                        return Ok(VInt(result));
+                        return Ok((VInt(result), read));
                     }
                     shift += 7;
                 }
@@ -222,7 +227,7 @@ impl BinarySerializable for VInt {
 #[cfg(test)]
 mod tests {
 
-    use super::{BinarySerializable, VInt, serialize_vint_u32};
+    use super::{serialize_vint_u32, BinaryDeserializable, VInt};
 
     fn aux_test_vint(val: u64) {
         let mut v = [14u8; 10];
@@ -237,7 +242,7 @@ mod tests {
         if num_bytes > 1 {
             assert!(1u64 << (7 * (num_bytes - 1)) <= val);
         }
-        let serdeser_val = VInt::deserialize(&mut &v[..]).unwrap();
+        let (serdeser_val, _) = VInt::deserialize(&v[..]).unwrap();
         assert_eq!(val, serdeser_val.0);
     }
 
