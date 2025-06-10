@@ -38,12 +38,14 @@ impl BinarySerializable for PreTokenizedString {
             ))
         }
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let json_text = <String as BinarySerializable>::deserialize(reader)?;
+impl BinaryDeserializable for PreTokenizedString {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        let (text, bytes_read) = <&str as BinaryDeserializable>::deserialize(buf)?;
 
-        if let Ok(value) = serde_json::from_str(&json_text) {
-            Ok(value)
+        if let Ok(value) = serde_json::from_str(&text) {
+            Ok((value, bytes_read))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::Other,
