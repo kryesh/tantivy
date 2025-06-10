@@ -2,13 +2,13 @@ use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
-use common::{BinarySerializable, FixedSize, OwnedBytes};
-use tantivy_bitpacker::{BitPacker, compute_num_bits};
+use common::{BinaryDeserializable, BinarySerializable, FixedSize, OwnedBytes};
+use tantivy_bitpacker::{compute_num_bits, BitPacker};
 use tantivy_fst::raw::Fst;
 use tantivy_fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
 
 use crate::block_match_automaton::can_block_match_automaton;
-use crate::{SSTableDataCorruption, TermOrdinal, common_prefix_len};
+use crate::{common_prefix_len, SSTableDataCorruption, TermOrdinal};
 
 #[derive(Debug, Clone)]
 pub enum SSTableIndex {
@@ -303,18 +303,23 @@ impl BinarySerializable for BlockStartAddr {
         self.first_ordinal.serialize(writer)
     }
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let byte_range_start = u64::deserialize(reader)? as usize;
-        let first_ordinal = u64::deserialize(reader)?;
-        Ok(BlockStartAddr {
-            first_ordinal,
-            byte_range_start,
-        })
-    }
-
     // Provided method
     fn num_bytes(&self) -> u64 {
         BlockStartAddr::SIZE_IN_BYTES as u64
+    }
+}
+
+impl BinaryDeserializable<'_> for BlockStartAddr {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        let (byte_range_start, size1) = u64::deserialize(buf)?;
+        let (first_ordinal, size2) = u64::deserialize(&buf[size1..])?;
+        Ok((
+            BlockStartAddr {
+                byte_range_start: byte_range_start as usize,
+                first_ordinal,
+            },
+            size1 + size2,
+        ))
     }
 }
 
@@ -524,28 +529,50 @@ impl BinarySerializable for BlockAddrBlockMetadata {
         self.num_bits();
         Ok(())
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let offset = u64::deserialize(reader)?;
-        let ref_block_addr = BlockStartAddr::deserialize(reader)?;
-        let range_start_slope = u32::deserialize(reader)?;
-        let first_ordinal_slope = u32::deserialize(reader)?;
-        let mut buffer = [0u8; 2];
-        reader.read_exact(&mut buffer)?;
-        let first_ordinal_nbits = buffer[0];
-        let range_start_nbits = buffer[1];
-        let block_len = u16::deserialize(reader)?;
-        Ok(BlockAddrBlockMetadata {
-            offset,
-            ref_block_addr,
-            range_start_slope,
-            first_ordinal_slope,
-            range_start_nbits,
-            first_ordinal_nbits,
-            block_len,
-            range_shift: 1 << (range_start_nbits - 1),
-            ordinal_shift: 1 << (first_ordinal_nbits - 1),
-        })
+impl BinaryDeserializable<'_> for BlockAddrBlockMetadata {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        let mut cursor = 0;
+        let offset = u64::deserialize(buf).map(|(o, len)| {
+            cursor += len;
+            o
+        })?;
+        let ref_block_addr = BlockStartAddr::deserialize(&buf[cursor..]).map(|(b, len)| {
+            cursor += len;
+            b
+        })?;
+        let range_start_slope = u32::deserialize(&buf[cursor..]).map(|(b, len)| {
+            cursor += len;
+            b
+        })?;
+        let first_ordinal_slope = u32::deserialize(&buf[cursor..]).map(|(b, len)| {
+            cursor += len;
+            b
+        })?;
+        let [first_ordinal_nbits, range_start_nbits] = buf[cursor..cursor + 2]
+            .try_into()
+            .map_err(|_| io::Error::other("Invalid buffer length"))?;
+        cursor += 2;
+        let block_len = u16::deserialize(&buf[cursor..]).map(|(b, len)| {
+            cursor += len;
+            b
+        })?;
+
+        Ok((
+            BlockAddrBlockMetadata {
+                offset,
+                ref_block_addr,
+                range_start_slope,
+                first_ordinal_slope,
+                range_start_nbits,
+                first_ordinal_nbits,
+                block_len,
+                range_shift: 1 << (range_start_nbits - 1),
+                ordinal_shift: 1 << (first_ordinal_nbits - 1),
+            },
+            cursor,
+        ))
     }
 }
 
@@ -565,9 +592,9 @@ struct BlockAddrStore {
 
 impl BlockAddrStore {
     fn open(term_info_store_file: OwnedBytes) -> io::Result<BlockAddrStore> {
-        let (mut len_slice, main_slice) = term_info_store_file.split(8);
-        let len = u64::deserialize(&mut len_slice)? as usize;
-        let (block_meta_bytes, addr_bytes) = main_slice.split(len);
+        let (len_slice, main_slice) = term_info_store_file.split(8);
+        let (len, _) = u64::deserialize(&len_slice)?;
+        let (block_meta_bytes, addr_bytes) = main_slice.split(len as usize);
         Ok(BlockAddrStore {
             block_meta_bytes,
             addr_bytes,
@@ -575,10 +602,12 @@ impl BlockAddrStore {
     }
 
     fn get_block_meta(&self, store_block_id: usize) -> Option<BlockAddrBlockMetadata> {
-        let mut block_data: &[u8] = self
+        let block_data: &[u8] = self
             .block_meta_bytes
             .get(store_block_id * BlockAddrBlockMetadata::SIZE_IN_BYTES..)?;
-        BlockAddrBlockMetadata::deserialize(&mut block_data).ok()
+        BlockAddrBlockMetadata::deserialize(block_data)
+            .map(|(meta, _)| meta)
+            .ok()
     }
 
     fn get(&self, block_id: u64) -> Option<BlockAddr> {
@@ -824,8 +853,8 @@ mod tests {
     use common::OwnedBytes;
 
     use super::*;
-    use crate::SSTableDataCorruption;
     use crate::block_match_automaton::tests::EqBuffer;
+    use crate::SSTableDataCorruption;
 
     #[test]
     fn test_sstable_index() {
