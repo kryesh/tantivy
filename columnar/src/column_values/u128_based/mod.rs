@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 mod compact_space;
 
-use common::{BinarySerializable, OwnedBytes, VInt};
+use common::{BinaryDeserializable, BinarySerializable, OwnedBytes, VInt};
 pub use compact_space::{
     CompactSpaceCompressor, CompactSpaceDecompressor, CompactSpaceU64Accessor,
 };
@@ -29,14 +29,21 @@ impl BinarySerializable for U128Header {
         self.codec_type.serialize(writer)?;
         Ok(())
     }
+}
 
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let num_vals = VInt::deserialize(reader)?.0 as u32;
-        let codec_type = U128FastFieldCodecType::deserialize(reader)?;
-        Ok(U128Header {
-            num_vals,
-            codec_type,
-        })
+impl BinaryDeserializable<'_> for U128Header {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        let (num_vals, num_vals_bytes_read) = VInt::deserialize(buf)?;
+        let num_vals = num_vals.val() as u32;
+        let (codec_type, codec_type_bytes_read) =
+            U128FastFieldCodecType::deserialize(&buf[num_vals_bytes_read..])?;
+        Ok((
+            U128Header {
+                num_vals,
+                codec_type,
+            },
+            num_vals_bytes_read + codec_type_bytes_read,
+        ))
     }
 }
 
@@ -77,12 +84,14 @@ impl BinarySerializable for U128FastFieldCodecType {
     fn serialize<W: Write + ?Sized>(&self, wrt: &mut W) -> io::Result<()> {
         self.to_code().serialize(wrt)
     }
+}
 
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let code = u8::deserialize(reader)?;
+impl BinaryDeserializable<'_> for U128FastFieldCodecType {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        let (code, offset) = u8::deserialize(buf)?;
         let codec_type: Self = Self::from_code(code)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Unknown code `{code}.`"))?;
-        Ok(codec_type)
+        Ok((codec_type, offset))
     }
 }
 
@@ -101,11 +110,11 @@ impl U128FastFieldCodecType {
 
 /// Returns the correct codec reader wrapped in the `Arc` for the data.
 pub fn open_u128_mapped<T: MonotonicallyMappableToU128 + Debug>(
-    mut bytes: OwnedBytes,
+    bytes: OwnedBytes,
 ) -> io::Result<Arc<dyn ColumnValues<T>>> {
-    let header = U128Header::deserialize(&mut bytes)?;
+    let (header, header_bytes) = U128Header::deserialize(&bytes)?;
     assert_eq!(header.codec_type, U128FastFieldCodecType::CompactSpace);
-    let reader = CompactSpaceDecompressor::open(bytes)?;
+    let reader = CompactSpaceDecompressor::open(bytes, header_bytes)?;
     let inverted: StrictlyMonotonicMappingInverter<StrictlyMonotonicMappingToInternal<T>> =
         StrictlyMonotonicMappingToInternal::<T>::new().into();
     Ok(Arc::new(monotonic_map_column(reader, inverted)))
@@ -120,21 +129,21 @@ pub fn open_u128_mapped<T: MonotonicallyMappableToU128 + Debug>(
 /// # Notice
 /// In case there are new codecs added, check for usages of `CompactSpaceDecompressorU64` and
 /// also handle the new codecs.
-pub fn open_u128_as_compact_u64(mut bytes: OwnedBytes) -> io::Result<Arc<dyn ColumnValues<u64>>> {
-    let header = U128Header::deserialize(&mut bytes)?;
+pub fn open_u128_as_compact_u64(bytes: OwnedBytes) -> io::Result<Arc<dyn ColumnValues<u64>>> {
+    let (header, header_bytes) = U128Header::deserialize(&bytes)?;
     assert_eq!(header.codec_type, U128FastFieldCodecType::CompactSpace);
-    let reader = CompactSpaceU64Accessor::open(bytes)?;
+    let reader = CompactSpaceU64Accessor::open(bytes, header_bytes)?;
     Ok(Arc::new(reader))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::column_values::CodecType;
     use crate::column_values::u64_based::{
-        ALL_U64_CODEC_TYPES, serialize_and_load_u64_based_column_values,
-        serialize_u64_based_column_values,
+        serialize_and_load_u64_based_column_values, serialize_u64_based_column_values,
+        ALL_U64_CODEC_TYPES,
     };
+    use crate::column_values::CodecType;
 
     #[test]
     fn test_serialize_deserialize_u128_header() {
@@ -144,7 +153,8 @@ pub(crate) mod tests {
         };
         let mut out = Vec::new();
         original.serialize(&mut out).unwrap();
-        let restored = U128Header::deserialize(&mut &out[..]).unwrap();
+        let (restored, bytes_read) = U128Header::deserialize(&mut &out[..]).unwrap();
+        assert_eq!(bytes_read, out.len());
         assert_eq!(restored, original);
     }
 

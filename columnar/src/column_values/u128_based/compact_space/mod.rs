@@ -21,11 +21,13 @@ mod blank_range;
 mod build_compact_space;
 
 use build_compact_space::get_compact_space;
-use common::{BinarySerializable, CountingWriter, OwnedBytes, VInt, VIntU128};
+use common::{
+    BinaryDeserializable, BinarySerializable, CountingWriter, OwnedBytes, VInt, VIntU128,
+};
 use tantivy_bitpacker::{BitPacker, BitUnpacker};
 
-use crate::RowId;
 use crate::column_values::ColumnValues;
+use crate::RowId;
 
 /// The cost per blank is quite hard actually, since blanks are delta encoded, the actual cost of
 /// blanks depends on the number of blanks.
@@ -76,18 +78,31 @@ impl BinarySerializable for CompactSpace {
 
         Ok(())
     }
+}
 
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let num_ranges = VInt::deserialize(reader)?.0;
-        let mut ranges_mapping: Vec<RangeMapping> = vec![];
+impl BinaryDeserializable<'_> for CompactSpace {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        let (num_ranges, mut offset) = VInt::deserialize(buf)?;
+        let num_ranges = num_ranges.val() as usize;
+        let mut ranges_mapping = Vec::with_capacity(num_ranges);
         let mut value = 0u128;
         let mut compact_start = 1u32; // 0 is reserved for `null`
         for _ in 0..num_ranges {
-            let blank_delta_start = VIntU128::deserialize(reader)?.0;
+            let blank_delta_start = VIntU128::deserialize(&buf[offset..])
+                .map(|(d, o)| {
+                    offset += o;
+                    d
+                })?
+                .0;
             value += blank_delta_start;
             let blank_start = value;
 
-            let blank_delta_end = VIntU128::deserialize(reader)?.0;
+            let blank_delta_end = VIntU128::deserialize(&buf[offset..])
+                .map(|(d, o)| {
+                    offset += o;
+                    d
+                })?
+                .0;
             value += blank_delta_end;
             let blank_end = value;
 
@@ -97,10 +112,10 @@ impl BinarySerializable for CompactSpace {
             };
             let range_length = range_mapping.range_length();
             ranges_mapping.push(range_mapping);
-            compact_start += range_length;
+            compact_start += range_length as u32;
         }
 
-        Ok(Self { ranges_mapping })
+        Ok((Self { ranges_mapping }, offset))
     }
 }
 
@@ -254,6 +269,7 @@ impl CompactSpaceCompressor {
 #[derive(Debug, Clone)]
 pub struct CompactSpaceDecompressor {
     data: OwnedBytes,
+    offset: usize,
     params: IPCodecParams,
 }
 
@@ -272,23 +288,48 @@ impl BinarySerializable for IPCodecParams {
 
         Ok(())
     }
+}
 
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let _header_flags = u64::deserialize(reader)?;
-        let min_value = VIntU128::deserialize(reader)?.0;
-        let max_value = VIntU128::deserialize(reader)?.0;
-        let num_vals = VIntU128::deserialize(reader)?.0 as u32;
-        let num_bits = u8::deserialize(reader)?;
-        let compact_space = CompactSpace::deserialize(reader)?;
-
-        Ok(Self {
-            compact_space,
-            bit_unpacker: BitUnpacker::new(num_bits),
-            min_value,
-            max_value,
-            num_vals,
-            num_bits,
-        })
+impl BinaryDeserializable<'_> for IPCodecParams {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        let (_header_flags, mut offset) = u64::deserialize(buf)?;
+        let min_value = VIntU128::deserialize(&buf[offset..])
+            .map(|(m, o)| {
+                offset += o;
+                m
+            })?
+            .0;
+        let max_value = VIntU128::deserialize(&buf[offset..])
+            .map(|(m, o)| {
+                offset += o;
+                m
+            })?
+            .0;
+        let num_vals = VIntU128::deserialize(&buf[offset..])
+            .map(|(n, o)| {
+                offset += o;
+                n
+            })?
+            .0 as u32;
+        let num_bits = u8::deserialize(&buf[offset..]).map(|(n, o)| {
+            offset += o;
+            n
+        })?;
+        let compact_space = CompactSpace::deserialize(&buf[offset..]).map(|(c, o)| {
+            offset += o;
+            c
+        })?;
+        Ok((
+            Self {
+                compact_space,
+                bit_unpacker: BitUnpacker::new(num_bits),
+                min_value,
+                max_value,
+                num_vals,
+                num_bits,
+            },
+            offset,
+        ))
     }
 }
 
@@ -301,8 +342,8 @@ impl BinarySerializable for IPCodecParams {
 /// When converting from the internal u64 to u128 `compact_to_u128` can be used.
 pub struct CompactSpaceU64Accessor(CompactSpaceDecompressor);
 impl CompactSpaceU64Accessor {
-    pub(crate) fn open(data: OwnedBytes) -> io::Result<CompactSpaceU64Accessor> {
-        let decompressor = CompactSpaceU64Accessor(CompactSpaceDecompressor::open(data)?);
+    pub(crate) fn open(data: OwnedBytes, offset: usize) -> io::Result<CompactSpaceU64Accessor> {
+        let decompressor = CompactSpaceU64Accessor(CompactSpaceDecompressor::open(data, offset)?);
         Ok(decompressor)
     }
     /// Convert a compact space value to u128
@@ -419,13 +460,17 @@ impl ColumnValues<u128> for CompactSpaceDecompressor {
 }
 
 impl CompactSpaceDecompressor {
-    pub fn open(data: OwnedBytes) -> io::Result<CompactSpaceDecompressor> {
-        let (data_slice, footer_len_bytes) = data.split_at(data.len() - 4);
-        let footer_len = u32::deserialize(&mut &footer_len_bytes[..])?;
+    pub fn open(data: OwnedBytes, offset: usize) -> io::Result<CompactSpaceDecompressor> {
+        let (data_slice, footer_len_bytes) = data[offset..].split_at(data.len() - 4);
+        let (footer_len, _) = u32::deserialize(&mut &footer_len_bytes[..])?;
 
         let data_footer = &data_slice[data_slice.len() - footer_len as usize..];
-        let params = IPCodecParams::deserialize(&mut &data_footer[..])?;
-        let decompressor = CompactSpaceDecompressor { data, params };
+        let (params, _) = IPCodecParams::deserialize(&mut &data_footer[..])?;
+        let decompressor = CompactSpaceDecompressor {
+            data,
+            offset,
+            params,
+        };
 
         Ok(decompressor)
     }
@@ -526,10 +571,10 @@ mod tests {
         let mut output: Vec<u8> = Vec::new();
         compact_space.serialize(&mut output).unwrap();
 
-        assert_eq!(
-            compact_space,
-            CompactSpace::deserialize(&mut &output[..]).unwrap()
-        );
+        let (deserialized, deserialized_len) = CompactSpace::deserialize(&mut &output[..]).unwrap();
+
+        assert_eq!(deserialized_len, output.len());
+        assert_eq!(compact_space, deserialized);
 
         for ip in ips {
             let compact = compact_space.u128_to_compact(ip).unwrap();
@@ -653,14 +698,12 @@ mod tests {
             ),
             &[3]
         );
-        assert!(
-            get_positions_for_value_range_helper(
-                &decomp,
-                99998u128..=99998u128,
-                complete_range.clone()
-            )
-            .is_empty()
-        );
+        assert!(get_positions_for_value_range_helper(
+            &decomp,
+            99998u128..=99998u128,
+            complete_range.clone()
+        )
+        .is_empty());
         assert_eq!(
             &get_positions_for_value_range_helper(
                 &decomp,
