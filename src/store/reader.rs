@@ -6,7 +6,7 @@ use std::ops::{AddAssign, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinaryDeserializable, BinarySerializable, OwnedBytes};
 use lru::LruCache;
 
 use super::footer::DocStoreFooter;
@@ -44,20 +44,22 @@ impl BinarySerializable for DocStoreVersion {
     fn serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         (*self as u32).serialize(writer)
     }
+}
 
-    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        Ok(match u32::deserialize(reader)? {
-            1 => DocStoreVersion::V1,
-            2 => DocStoreVersion::V2,
-            v => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid doc store version {}", v),
-                ))
-            }
-        })
+impl BinaryDeserializable for DocStoreVersion {
+    fn deserialize(buf: &'de [u8]) -> io::Result<(Self, usize)> {
+        let (version, bytes_read) = u32::deserialize(buf)?;
+        match version {
+            1 => Ok((DocStoreVersion::V1, bytes_read)),
+            2 => Ok((DocStoreVersion::V2, bytes_read)),
+            v => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid doc store version {}", v),
+            )),
+        }
     }
 }
+
 
 /// Reads document off tantivy's [`Store`](./index.html)
 pub struct StoreReader {
@@ -357,7 +359,7 @@ fn block_read_index(block: &[u8], doc_pos: u32) -> crate::Result<Range<usize>> {
     let size_of_u32 = std::mem::size_of::<u32>();
 
     let index_len_pos = block.len() - size_of_u32;
-    let index_len = u32::deserialize(&mut &block[index_len_pos..])? as usize;
+    let index_len = u32::deserialize(&mut &block[index_len_pos..]).map(|(l, _)| l as usize)?;
 
     if doc_pos > index_len {
         return Err(crate::TantivyError::InternalError(
@@ -368,8 +370,8 @@ fn block_read_index(block: &[u8], doc_pos: u32) -> crate::Result<Range<usize>> {
     let index_start = block.len() - (index_len + 1) * size_of_u32;
     let index = &block[index_start..index_start + index_len * size_of_u32];
 
-    let start_offset = u32::deserialize(&mut &index[doc_pos * size_of_u32..])? as usize;
-    let end_offset = u32::deserialize(&mut &index[(doc_pos + 1) * size_of_u32..])
+    let start_offset = u32::deserialize(&mut &index[doc_pos * size_of_u32..]).map(|(l, _)| l as usize)?;
+    let end_offset = u32::deserialize(&mut &index[(doc_pos + 1) * size_of_u32..]).map(|(l, _)| l as usize)
         .unwrap_or(index_start as u32) as usize;
     Ok(start_offset..end_offset)
 }
