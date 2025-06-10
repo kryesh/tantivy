@@ -1,8 +1,8 @@
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::{fmt, io};
 
-use byteorder::{ReadBytesExt, WriteBytesExt};
+use byteorder::{ByteOrder, WriteBytesExt};
 
 use crate::{Endianness, VInt};
 
@@ -25,12 +25,17 @@ impl io::Write for Counter {
     }
 }
 
+fn end_of_buffer_error<T>() -> Result<T, io::Error> {
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "Unexpected end of buffer",
+    ))
+}
+
 /// Trait for a simple binary serialization.
 pub trait BinarySerializable: fmt::Debug + Sized {
     /// Serialize
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()>;
-    /// Deserialize
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self>;
 
     fn num_bytes(&self) -> u64 {
         let mut counter = Counter::default();
@@ -39,18 +44,9 @@ pub trait BinarySerializable: fmt::Debug + Sized {
     }
 }
 
-pub trait DeserializeFrom<T: BinarySerializable> {
-    fn deserialize(&mut self) -> io::Result<T>;
-}
-
-/// Implement deserialize from &[u8] for all types which implement BinarySerializable.
-///
-/// TryFrom would actually be preferable, but not possible because of the orphan
-/// rules (not completely sure if this could be resolved)
-impl<T: BinarySerializable> DeserializeFrom<T> for &[u8] {
-    fn deserialize(&mut self) -> io::Result<T> {
-        T::deserialize(self)
-    }
+pub trait BinaryDeserializable<'de>: Sized {
+    /// Returns the deserialized object and the number of bytes read.
+    fn deserialize(buf: &'de [u8]) -> io::Result<(Self, usize)>;
 }
 
 /// `FixedSize` marks a `BinarySerializable` as
@@ -63,8 +59,11 @@ impl BinarySerializable for () {
     fn serialize<W: Write + ?Sized>(&self, _: &mut W) -> io::Result<()> {
         Ok(())
     }
-    fn deserialize<R: Read>(_: &mut R) -> io::Result<Self> {
-        Ok(())
+}
+
+impl BinaryDeserializable<'_> for () {
+    fn deserialize(_buf: &[u8]) -> io::Result<(Self, usize)> {
+        Ok(((), 0))
     }
 }
 
@@ -80,14 +79,23 @@ impl<T: BinarySerializable> BinarySerializable for Vec<T> {
         }
         Ok(())
     }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Vec<T>> {
-        let num_items = <VInt as BinarySerializable>::deserialize(reader)?.val();
-        let mut items: Vec<T> = Vec::with_capacity(num_items as usize);
+}
+
+impl<T: for<'de> BinaryDeserializable<'de>> BinaryDeserializable<'_> for Vec<T> {
+    fn deserialize(buf: &[u8]) -> io::Result<(Vec<T>, usize)> {
+        let (num_items, mut bytes_read) =
+            VInt::deserialize(buf).map(|(v, bytes)| (v.val() as usize, bytes))?;
+        let mut items: Vec<T> = Vec::with_capacity(num_items);
         for _ in 0..num_items {
-            let item = T::deserialize(reader)?;
-            items.push(item);
+            if let Some(slice) = buf.get(bytes_read..) {
+                let (item, item_bytes) = T::deserialize(slice)?;
+                items.push(item);
+                bytes_read += item_bytes;
+            } else {
+                return end_of_buffer_error();
+            }
         }
-        Ok(items)
+        Ok((items, bytes_read))
     }
 }
 
@@ -95,9 +103,6 @@ impl<Left: BinarySerializable, Right: BinarySerializable> BinarySerializable for
     fn serialize<W: Write + ?Sized>(&self, write: &mut W) -> io::Result<()> {
         self.0.serialize(write)?;
         self.1.serialize(write)
-    }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        Ok((Left::deserialize(reader)?, Right::deserialize(reader)?))
     }
 }
 impl<Left: BinarySerializable + FixedSize, Right: BinarySerializable + FixedSize> FixedSize
@@ -110,9 +115,16 @@ impl BinarySerializable for u32 {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u32::<Endianness>(*self)
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<u32> {
-        reader.read_u32::<Endianness>()
+impl BinaryDeserializable<'_> for u32 {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if buf.len() >= size_of::<Self>() {
+            let value = Endianness::read_u32(buf);
+            Ok((value, size_of::<Self>()))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -124,9 +136,16 @@ impl BinarySerializable for u16 {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u16::<Endianness>(*self)
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<u16> {
-        reader.read_u16::<Endianness>()
+impl BinaryDeserializable<'_> for u16 {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if buf.len() >= size_of::<Self>() {
+            let value = Endianness::read_u16(buf);
+            Ok((value, size_of::<Self>()))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -138,8 +157,16 @@ impl BinarySerializable for u64 {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u64::<Endianness>(*self)
     }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        reader.read_u64::<Endianness>()
+}
+
+impl BinaryDeserializable<'_> for u64 {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if buf.len() >= size_of::<Self>() {
+            let value = Endianness::read_u64(buf);
+            Ok((value, size_of::<Self>()))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -151,8 +178,16 @@ impl BinarySerializable for u128 {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u128::<Endianness>(*self)
     }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        reader.read_u128::<Endianness>()
+}
+
+impl BinaryDeserializable<'_> for u128 {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if buf.len() >= size_of::<Self>() {
+            let value = Endianness::read_u128(buf);
+            Ok((value, size_of::<Self>()))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -164,8 +199,16 @@ impl BinarySerializable for f32 {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_f32::<Endianness>(*self)
     }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        reader.read_f32::<Endianness>()
+}
+
+impl BinaryDeserializable<'_> for f32 {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if buf.len() >= size_of::<Self>() {
+            let value = Endianness::read_f32(buf);
+            Ok((value, size_of::<Self>()))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -177,8 +220,16 @@ impl BinarySerializable for i64 {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_i64::<Endianness>(*self)
     }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        reader.read_i64::<Endianness>()
+}
+
+impl BinaryDeserializable<'_> for i64 {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if buf.len() >= size_of::<Self>() {
+            let value = Endianness::read_i64(buf);
+            Ok((value, size_of::<Self>()))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -190,8 +241,16 @@ impl BinarySerializable for f64 {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_f64::<Endianness>(*self)
     }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        reader.read_f64::<Endianness>()
+}
+
+impl BinaryDeserializable<'_> for f64 {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if buf.len() >= size_of::<Self>() {
+            let value = Endianness::read_f64(buf);
+            Ok((value, size_of::<Self>()))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -203,8 +262,15 @@ impl BinarySerializable for u8 {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u8(*self)
     }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<u8> {
-        reader.read_u8()
+}
+
+impl BinaryDeserializable<'_> for u8 {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if !buf.is_empty() {
+            Ok((buf[0], 1))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -216,15 +282,21 @@ impl BinarySerializable for bool {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u8(u8::from(*self))
     }
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<bool> {
-        let val = reader.read_u8()?;
-        match val {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid bool value on deserialization, data corrupted",
-            )),
+}
+
+impl BinaryDeserializable<'_> for bool {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        if !buf.is_empty() {
+            match buf[0] {
+                0 => Ok((false, 1)),
+                1 => Ok((true, 1)),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid bool value on deserialization, data corrupted",
+                )),
+            }
+        } else {
+            end_of_buffer_error()
         }
     }
 }
@@ -239,14 +311,49 @@ impl BinarySerializable for String {
         BinarySerializable::serialize(&VInt(data.len() as u64), writer)?;
         writer.write_all(data)
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<String> {
-        let string_length = <VInt as BinarySerializable>::deserialize(reader)?.val() as usize;
-        let mut result = String::with_capacity(string_length);
-        reader
-            .take(string_length as u64)
-            .read_to_string(&mut result)?;
-        Ok(result)
+impl BinaryDeserializable<'_> for String {
+    fn deserialize(buf: &[u8]) -> io::Result<(Self, usize)> {
+        let (vint, vint_size) = VInt::deserialize(buf)?;
+        let string_length = vint.val() as usize;
+        let start = vint_size;
+        let end = start + string_length;
+
+        if let Some(slice) = buf.get(start..end) {
+            let result = String::from_utf8(slice.to_vec()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence")
+            })?;
+            Ok((result, end))
+        } else {
+            end_of_buffer_error()
+        }
+    }
+}
+
+impl BinarySerializable for &str {
+    fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+        let data: &[u8] = self.as_bytes();
+        BinarySerializable::serialize(&VInt(data.len() as u64), writer)?;
+        writer.write_all(data)
+    }
+}
+
+impl<'de> BinaryDeserializable<'de> for &'de str {
+    fn deserialize(buf: &'de [u8]) -> io::Result<(Self, usize)> {
+        let (vint, vint_size) = VInt::deserialize(buf)?;
+        let string_length = vint.val() as usize;
+        let start = vint_size;
+        let end = start + string_length;
+
+        if let Some(slice) = buf.get(start..end) {
+            let result = str::from_utf8(slice).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence")
+            })?;
+            Ok((result, end))
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -256,14 +363,26 @@ impl<'a> BinarySerializable for Cow<'a, str> {
         BinarySerializable::serialize(&VInt(data.len() as u64), writer)?;
         writer.write_all(data)
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Cow<'a, str>> {
-        let string_length = <VInt as BinarySerializable>::deserialize(reader)?.val() as usize;
-        let mut result = String::with_capacity(string_length);
-        reader
-            .take(string_length as u64)
-            .read_to_string(&mut result)?;
-        Ok(Cow::Owned(result))
+impl<'de> BinaryDeserializable<'de> for Cow<'de, str> {
+    fn deserialize(buf: &'de [u8]) -> io::Result<(Self, usize)> {
+        let (vint, vint_size) = VInt::deserialize(buf)?;
+        let string_length = vint.val() as usize;
+        let start = vint_size;
+        let end = start + string_length;
+
+        if let Some(slice) = buf.get(start..end) {
+            match str::from_utf8(slice) {
+                Ok(valid_str) => Ok((Cow::Borrowed(valid_str), end)),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid UTF-8 sequence",
+                )),
+            }
+        } else {
+            end_of_buffer_error()
+        }
     }
 }
 
@@ -275,15 +394,20 @@ impl<'a> BinarySerializable for Cow<'a, [u8]> {
         }
         Ok(())
     }
+}
 
-    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Cow<'a, [u8]>> {
-        let num_items = <VInt as BinarySerializable>::deserialize(reader)?.val();
-        let mut items: Vec<u8> = Vec::with_capacity(num_items as usize);
-        for _ in 0..num_items {
-            let item = <u8 as BinarySerializable>::deserialize(reader)?;
-            items.push(item);
+impl<'de> BinaryDeserializable<'de> for Cow<'de, [u8]> {
+    fn deserialize(buf: &'de [u8]) -> io::Result<(Self, usize)> {
+        let (vint, vint_size) = VInt::deserialize(buf)?;
+        let len = vint.val();
+        let start = vint_size;
+        let end = start + len as usize;
+
+        if let Some(slice) = buf.get(start..end) {
+            Ok((Cow::Borrowed(slice), end))
+        } else {
+            end_of_buffer_error()
         }
-        Ok(Cow::Owned(items))
     }
 }
 
@@ -297,13 +421,16 @@ pub mod test {
         assert_eq!(buffer.len(), O::SIZE_IN_BYTES);
     }
 
-    fn serialize_test<T: BinarySerializable + Eq>(v: T) -> usize {
+    fn serialize_test<T: BinarySerializable + for<'a> BinaryDeserializable<'a> + Eq>(
+        v: T,
+    ) -> usize {
         let mut buffer: Vec<u8> = Vec::new();
         v.serialize(&mut buffer).unwrap();
         let num_bytes = buffer.len();
-        let mut cursor = &buffer[..];
-        let deser = T::deserialize(&mut cursor).unwrap();
+        let (deser, bytes_read) = T::deserialize(&buffer).unwrap();
         assert_eq!(deser, v);
+        assert_eq!(bytes_read, num_bytes);
+
         num_bytes
     }
 
