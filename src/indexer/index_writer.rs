@@ -4,6 +4,7 @@ use std::thread;
 use std::thread::JoinHandle;
 
 use common::BitSet;
+use itertools::Itertools;
 use smallvec::smallvec;
 
 use super::operation::{AddOperation, UserOperation};
@@ -20,7 +21,7 @@ use crate::indexer::operation::DeleteOperation;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
 use crate::query::{EnableScoring, Query, TermQuery};
-use crate::schema::document::Document;
+use crate::schema::document::{self, Document};
 use crate::schema::{IndexRecordOption, TantivyDocument, Term};
 use crate::{FutureResult, Opstamp};
 
@@ -728,6 +729,40 @@ impl<D: Document> IndexWriter<D> {
         let opstamp = self.stamper.stamp();
         self.send_add_documents_batch(smallvec![AddOperation { opstamp, document }])?;
         Ok(opstamp)
+    }
+
+    /// Adds a batch of documents.
+    ///
+    /// If the indexing pipeline is full, this call may block.
+    ///
+    /// `count` must be the exact number of documents in the batch.
+    pub fn add_document_batch<I: IntoIterator<Item = D>>(
+        &self,
+        documents: I,
+    ) -> crate::Result<Opstamp> {
+        let mut last_stamp = 0;
+        for batch in documents
+            .into_iter()
+            .map(|d| (d, self.stamper.stamp()))
+            .inspect(|(_, s)| last_stamp = *s)
+            .chunks(4)
+            .into_iter()
+            .map(|chunk| {
+                chunk
+                    .map(|(document, opstamp)| AddOperation { opstamp, document })
+                    .collect()
+            })
+        {
+            self.send_add_documents_batch(batch)?;
+        }
+
+        if last_stamp == 0 {
+            Err(crate::TantivyError::InvalidArgument(
+                "Empty batch".to_string(),
+            ))
+        } else {
+            Ok(last_stamp)
+        }
     }
 
     /// Gets a range of stamps from the stamper and "pops" the last stamp
